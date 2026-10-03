@@ -1,6 +1,7 @@
-"""ATLAS data generator, step 3: build the database from the schema file,
+"""ATLAS data generator, step 4a: build the database from the schema file,
 load the fixed reference tables (products, customers), create the
-customer profiles, and plan how many sales lines each market-month gets.
+customer profiles, plan sales lines per market-month, and assign each line
+a date, customer, product and quantity (prices and costs come in step 4b).
 
 Rules: docs/DATA_GENERATION_RULES.md (v0.2). All data is synthetic.
 """
@@ -32,6 +33,11 @@ MARKET_VOLUME = {
     "Vietnam": {"base_lines": 18, "growth": 0.15, "sigma": 0.10},
     "Indonesia": {"base_lines": 13, "growth": 0.08, "sigma": 0.20},
 }
+
+# Product mix and quantity per sales line (rules section 5). Proposed values.
+PRODUCT_MIX = {"P01": 40, "P02": 35, "P03": 25}  # relative weights (percent)
+MEDIAN_QTY = {"P01": 20, "P02": 40, "P03": 15}  # units of sale per line
+QTY_SIGMA = 0.4
 
 # Probability that a sales line is a special-discount deal (rules section 6).
 SPECIAL_PROB = {"C11": 0.45, "C18": 0.45, "C02": 0.15, "C09": 0.15, "C16": 0.15}
@@ -100,6 +106,45 @@ def build_line_counts():
     return counts
 
 
+def build_sales_lines(line_counts, profiles):
+    """Sales lines with date, customer, product and quantity (no prices yet).
+
+    Customer, product and day are drawn with a generator seeded SEED + 3;
+    quantities with a generator seeded SEED + 4. Customers are chosen in
+    proportion to their tier weight within the market. The day (1-28) uses
+    the assignment generator because the rules do not name a separate seed.
+    Lines are then sorted by date and numbered 1, 2, 3, ...
+    """
+    rng_assign = random.Random(SEED + 3)
+    rng_qty = random.Random(SEED + 4)
+    product_ids = list(PRODUCT_MIX)
+    product_weights = list(PRODUCT_MIX.values())
+
+    lines = []
+    for (month, market), n_lines in line_counts.items():
+        ids = [cid for cid, p in profiles.items() if p["market"] == market]
+        weights = [profiles[cid]["weight"] for cid in ids]
+        for _ in range(n_lines):
+            customer_id = rng_assign.choices(ids, weights=weights)[0]
+            product_id = rng_assign.choices(product_ids, weights=product_weights)[0]
+            day = rng_assign.randint(1, 28)
+            noise = rng_qty.lognormvariate(0, QTY_SIGMA)
+            quantity = max(1, round(MEDIAN_QTY[product_id] * noise))
+            lines.append(
+                {
+                    "sale_date": f"{month[:8]}{day:02d}",
+                    "customer_id": customer_id,
+                    "product_id": product_id,
+                    "quantity": quantity,
+                }
+            )
+
+    lines.sort(key=lambda r: (r["sale_date"], r["customer_id"], r["product_id"]))
+    for number, line in enumerate(lines, start=1):
+        line["sales_line_id"] = number
+    return lines
+
+
 def main():
     if DB_PATH.exists():
         DB_PATH.unlink()
@@ -140,6 +185,22 @@ def main():
             grand_total += total
             print(f"{market:<10} {year}: {total}")
     print(f"total: {grand_total}")
+
+    lines = build_sales_lines(line_counts, profiles)
+    print()
+    print(f"sales lines drafted (no prices yet, not stored): {len(lines)}")
+    for product_id in PRODUCT_MIX:
+        qtys = [r["quantity"] for r in lines if r["product_id"] == product_id]
+        print(
+            f"{product_id}: {len(qtys)} lines ({len(qtys) / len(lines):.1%}), "
+            f"average quantity {sum(qtys) / len(qtys):.1f}, "
+            f"min {min(qtys)}, max {max(qtys)}"
+        )
+    large_lines = sum(1 for r in lines if tier_of(r["customer_id"]) == "Large")
+    print(f"Large-tier customers' share of lines: {large_lines / len(lines):.1%}")
+    print("first 3 lines:")
+    for line in lines[:3]:
+        print(line)
 
     conn.close()
 
