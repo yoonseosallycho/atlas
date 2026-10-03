@@ -1,8 +1,10 @@
-"""ATLAS data generator, step 1: build the database from the schema file
-and load the fixed reference tables (products, customers).
+"""ATLAS data generator, step 2: build the database from the schema file,
+load the fixed reference tables (products, customers), and create the
+customer profiles used by later steps.
 
 Rules: docs/DATA_GENERATION_RULES.md (v0.2). All data is synthetic.
 """
+import random
 import sqlite3
 from pathlib import Path
 
@@ -10,11 +12,22 @@ ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "atlas.db"
 SCHEMA_PATH = ROOT / "sql" / "01_schema.sql"
 
+SEED = 20240101  # fixed seed (rules section 3)
+
 PRODUCTS = [
     ("P01", "Industrial Cutting Fluid", "20L container"),
     ("P02", "Abrasive Disc Pack", "box of 50"),
     ("P03", "Protective Glove Set", "box of 100 pairs"),
 ]
+
+# Purchase-size tiers (rules section 6). Every customer not listed is Small.
+LARGE = ["C01", "C02", "C08", "C09", "C15"]
+MEDIUM = ["C03", "C04", "C05", "C10", "C11", "C16"]
+TIER_WEIGHT = {"Large": 7, "Medium": 3, "Small": 1}
+
+# Probability that a sales line is a special-discount deal (rules section 6).
+SPECIAL_PROB = {"C11": 0.45, "C18": 0.45, "C02": 0.15, "C09": 0.15, "C16": 0.15}
+DEFAULT_SPECIAL_PROB = 0.03
 
 
 def build_customers():
@@ -29,6 +42,34 @@ def build_customers():
     return rows
 
 
+def tier_of(customer_id):
+    if customer_id in LARGE:
+        return "Large"
+    if customer_id in MEDIUM:
+        return "Medium"
+    return "Small"
+
+
+def build_customer_profiles(customers):
+    """Per-customer settings used when generating sales (not stored in the DB).
+
+    price_adj is a fixed standing discount/premium drawn once per customer
+    from Uniform(-0.04, +0.04), using its own generator seeded SEED + 1.
+    """
+    rng = random.Random(SEED + 1)
+    profiles = {}
+    for customer_id, _name, market in customers:
+        tier = tier_of(customer_id)
+        profiles[customer_id] = {
+            "market": market,
+            "tier": tier,
+            "weight": TIER_WEIGHT[tier],
+            "price_adj": rng.uniform(-0.04, 0.04),
+            "special_prob": SPECIAL_PROB.get(customer_id, DEFAULT_SPECIAL_PROB),
+        }
+    return profiles
+
+
 def main():
     if DB_PATH.exists():
         DB_PATH.unlink()
@@ -37,13 +78,24 @@ def main():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA_PATH.read_text())
 
+    customers = build_customers()
     conn.executemany("INSERT INTO products VALUES (?, ?, ?)", PRODUCTS)
-    conn.executemany("INSERT INTO customers VALUES (?, ?, ?)", build_customers())
+    conn.executemany("INSERT INTO customers VALUES (?, ?, ?)", customers)
     conn.commit()
 
     for table in ("products", "customers", "sales", "monthly_targets"):
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"{table}: {count} rows")
+
+    profiles = build_customer_profiles(customers)
+    print()
+    print("customer profiles (not stored in the database):")
+    for customer_id, p in profiles.items():
+        print(
+            f"{customer_id} {p['market']:<10} {p['tier']:<7} "
+            f"weight={p['weight']} price_adj={p['price_adj']:+.4f} "
+            f"special_prob={p['special_prob']}"
+        )
 
     conn.close()
 
