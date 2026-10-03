@@ -1,10 +1,12 @@
-"""ATLAS data generator, step 4a: build the database from the schema file,
+"""ATLAS data generator, step 4b: build the database from the schema file,
 load the fixed reference tables (products, customers), create the
-customer profiles, plan sales lines per market-month, and assign each line
-a date, customer, product and quantity (prices and costs come in step 4b).
+customer profiles, plan sales lines per market-month, assign each line a
+date, customer, product and quantity, price and cost every line, and store
+the sales lines. Monthly targets come in step 5.
 
 Rules: docs/DATA_GENERATION_RULES.md (v0.2). All data is synthetic.
 """
+import csv
 import random
 import sqlite3
 from pathlib import Path
@@ -38,6 +40,14 @@ MARKET_VOLUME = {
 PRODUCT_MIX = {"P01": 40, "P02": 35, "P03": 25}  # relative weights (percent)
 MEDIAN_QTY = {"P01": 20, "P02": 40, "P03": 15}  # units of sale per line
 QTY_SIGMA = 0.4
+
+# Price and cost rules (rules sections 5 and 7). Base values are per unit of sale.
+BASE_PRICE = {"P01": 100.0, "P02": 60.0, "P03": 150.0}
+BASE_COGS = {"P01": 70.0, "P02": 45.0, "P03": 95.0}
+TXN_NOISE = 0.04  # per-line price variation, +/- 4%
+PRICE_MULTIPLIER_RANGE = (0.92, 1.08)  # normal lines stay within +/- 8%
+SPECIAL_DEPTH = (0.12, 0.30)  # extra discount on special-discount lines
+COGS_NOISE = 0.03  # per-line cost variation, +/- 3%
 
 # Probability that a sales line is a special-discount deal (rules section 6).
 SPECIAL_PROB = {"C11": 0.45, "C18": 0.45, "C02": 0.15, "C09": 0.15, "C16": 0.15}
@@ -145,6 +155,56 @@ def build_sales_lines(line_counts, profiles):
     return lines
 
 
+def add_prices_and_costs(lines, profiles):
+    """Add net_unit_price_usd and unit_cogs_usd to every line.
+
+    Order of steps for each line (rules section 7):
+      1. normal price = base price * (1 + customer price_adj + line noise),
+         kept within +/- 8% of base (generator SEED + 5)
+      2. decide whether it is a special-discount deal, using the customer's
+         probability (generator SEED + 6)
+      3. if special, take an extra 12-30% off the normal price (SEED + 6)
+      4. round the price to 2 decimals
+    Unit cost = base cost * (1 + noise within +/- 3%) (generator SEED + 7).
+    Lines are processed in sales_line_id order so results are reproducible.
+    """
+    rng_price = random.Random(SEED + 5)
+    rng_special = random.Random(SEED + 6)
+    rng_cost = random.Random(SEED + 7)
+
+    for line in lines:
+        profile = profiles[line["customer_id"]]
+        product_id = line["product_id"]
+
+        multiplier = 1 + profile["price_adj"] + rng_price.uniform(-TXN_NOISE, TXN_NOISE)
+        low, high = PRICE_MULTIPLIER_RANGE
+        multiplier = min(high, max(low, multiplier))
+        price = BASE_PRICE[product_id] * multiplier
+
+        is_special = rng_special.random() < profile["special_prob"]
+        special_pct = 0.0
+        if is_special:
+            special_pct = rng_special.uniform(*SPECIAL_DEPTH)
+            price = price * (1 - special_pct)
+
+        cogs = BASE_COGS[product_id] * (1 + rng_cost.uniform(-COGS_NOISE, COGS_NOISE))
+
+        line["net_unit_price_usd"] = round(price, 2)
+        line["unit_cogs_usd"] = round(cogs, 2)
+        line["is_special"] = is_special
+        line["special_pct"] = round(special_pct, 4)
+
+
+def write_generation_log(lines):
+    """Helper file for validation only (kept out of Git by .gitignore)."""
+    path = ROOT / "generation_log.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["sales_line_id", "is_special_discount", "special_discount_pct"])
+        for r in lines:
+            writer.writerow([r["sales_line_id"], int(r["is_special"]), r["special_pct"]])
+
+
 def main():
     if DB_PATH.exists():
         DB_PATH.unlink()
@@ -154,53 +214,33 @@ def main():
     conn.executescript(SCHEMA_PATH.read_text())
 
     customers = build_customers()
+    profiles = build_customer_profiles(customers)
+    line_counts = build_line_counts()
+    lines = build_sales_lines(line_counts, profiles)
+    add_prices_and_costs(lines, profiles)
+
     conn.executemany("INSERT INTO products VALUES (?, ?, ?)", PRODUCTS)
     conn.executemany("INSERT INTO customers VALUES (?, ?, ?)", customers)
+    conn.executemany(
+        "INSERT INTO sales (sales_line_id, sale_date, customer_id, product_id, "
+        "quantity, net_unit_price_usd, unit_cogs_usd) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                r["sales_line_id"], r["sale_date"], r["customer_id"], r["product_id"],
+                r["quantity"], r["net_unit_price_usd"], r["unit_cogs_usd"],
+            )
+            for r in lines
+        ],
+    )
     conn.commit()
+    write_generation_log(lines)
 
     for table in ("products", "customers", "sales", "monthly_targets"):
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"{table}: {count} rows")
-
-    profiles = build_customer_profiles(customers)
-    print()
-    print("customer profiles (not stored in the database):")
-    for customer_id, p in profiles.items():
-        print(
-            f"{customer_id} {p['market']:<10} {p['tier']:<7} "
-            f"weight={p['weight']} price_adj={p['price_adj']:+.4f} "
-            f"special_prob={p['special_prob']}"
-        )
-
-    line_counts = build_line_counts()
-    print()
-    print("planned sales lines (not stored yet):")
-    grand_total = 0
-    for market in MARKET_VOLUME:
-        for year in ("2024", "2025"):
-            total = sum(
-                n for (month, m), n in line_counts.items()
-                if m == market and month.startswith(year)
-            )
-            grand_total += total
-            print(f"{market:<10} {year}: {total}")
-    print(f"total: {grand_total}")
-
-    lines = build_sales_lines(line_counts, profiles)
-    print()
-    print(f"sales lines drafted (no prices yet, not stored): {len(lines)}")
-    for product_id in PRODUCT_MIX:
-        qtys = [r["quantity"] for r in lines if r["product_id"] == product_id]
-        print(
-            f"{product_id}: {len(qtys)} lines ({len(qtys) / len(lines):.1%}), "
-            f"average quantity {sum(qtys) / len(qtys):.1f}, "
-            f"min {min(qtys)}, max {max(qtys)}"
-        )
-    large_lines = sum(1 for r in lines if tier_of(r["customer_id"]) == "Large")
-    print(f"Large-tier customers' share of lines: {large_lines / len(lines):.1%}")
-    print("first 3 lines:")
-    for line in lines[:3]:
-        print(line)
+    special = sum(1 for r in lines if r["is_special"])
+    print(f"special-discount lines (from generation log): {special}")
+    print("wrote generation_log.csv")
 
     conn.close()
 

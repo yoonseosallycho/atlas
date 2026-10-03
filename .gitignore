@@ -1,2 +1,3 @@
 *.db
 .DS_Store
+generation_log.csv
