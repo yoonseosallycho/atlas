@@ -1,6 +1,6 @@
-"""ATLAS data generator, step 2: build the database from the schema file,
-load the fixed reference tables (products, customers), and create the
-customer profiles used by later steps.
+"""ATLAS data generator, step 3: build the database from the schema file,
+load the fixed reference tables (products, customers), create the
+customer profiles, and plan how many sales lines each market-month gets.
 
 Rules: docs/DATA_GENERATION_RULES.md (v0.2). All data is synthetic.
 """
@@ -24,6 +24,14 @@ PRODUCTS = [
 LARGE = ["C01", "C02", "C08", "C09", "C15"]
 MEDIUM = ["C03", "C04", "C05", "C10", "C11", "C16"]
 TIER_WEIGHT = {"Large": 7, "Medium": 3, "Small": 1}
+
+# Sales-line volume by market (rules section 9). All values are Proposed.
+# base_lines = lines in 2024-01; growth = annual growth; sigma = demand volatility.
+MARKET_VOLUME = {
+    "Thailand": {"base_lines": 28, "growth": 0.03, "sigma": 0.05},
+    "Vietnam": {"base_lines": 18, "growth": 0.15, "sigma": 0.10},
+    "Indonesia": {"base_lines": 13, "growth": 0.08, "sigma": 0.20},
+}
 
 # Probability that a sales line is a special-discount deal (rules section 6).
 SPECIAL_PROB = {"C11": 0.45, "C18": 0.45, "C02": 0.15, "C09": 0.15, "C16": 0.15}
@@ -70,6 +78,28 @@ def build_customer_profiles(customers):
     return profiles
 
 
+def month_starts():
+    """The 24 months 2024-01 to 2025-12 as 'YYYY-MM-01' text."""
+    return [f"{2024 + t // 12}-{t % 12 + 1:02d}-01" for t in range(24)]
+
+
+def build_line_counts():
+    """Number of sales lines for each (month_start, market).
+
+    lines = round(base_lines * (1 + growth) ** (t / 12) * demand_factor)
+    demand_factor ~ Normal(1, sigma), clipped to [0.5, 1.5], drawn once per
+    market-month with its own generator seeded SEED + 2.
+    """
+    rng = random.Random(SEED + 2)
+    counts = {}
+    for t, month in enumerate(month_starts()):
+        for market, v in MARKET_VOLUME.items():
+            factor = min(1.5, max(0.5, rng.gauss(1.0, v["sigma"])))
+            expected = v["base_lines"] * (1 + v["growth"]) ** (t / 12)
+            counts[(month, market)] = round(expected * factor)
+    return counts
+
+
 def main():
     if DB_PATH.exists():
         DB_PATH.unlink()
@@ -96,6 +126,20 @@ def main():
             f"weight={p['weight']} price_adj={p['price_adj']:+.4f} "
             f"special_prob={p['special_prob']}"
         )
+
+    line_counts = build_line_counts()
+    print()
+    print("planned sales lines (not stored yet):")
+    grand_total = 0
+    for market in MARKET_VOLUME:
+        for year in ("2024", "2025"):
+            total = sum(
+                n for (month, m), n in line_counts.items()
+                if m == market and month.startswith(year)
+            )
+            grand_total += total
+            print(f"{market:<10} {year}: {total}")
+    print(f"total: {grand_total}")
 
     conn.close()
 
