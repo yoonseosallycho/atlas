@@ -1,8 +1,8 @@
-"""ATLAS data generator, step 4b: build the database from the schema file,
+"""ATLAS data generator, step 5: build the database from the schema file,
 load the fixed reference tables (products, customers), create the
 customer profiles, plan sales lines per market-month, assign each line a
 date, customer, product and quantity, price and cost every line, and store
-the sales lines. Monthly targets come in step 5.
+the sales lines, and create the monthly targets from the plan assumptions.
 
 Rules: docs/DATA_GENERATION_RULES.md (v0.2). All data is synthetic.
 """
@@ -48,6 +48,18 @@ TXN_NOISE = 0.04  # per-line price variation, +/- 4%
 PRICE_MULTIPLIER_RANGE = (0.92, 1.08)  # normal lines stay within +/- 8%
 SPECIAL_DEPTH = (0.12, 0.30)  # extra discount on special-discount lines
 COGS_NOISE = 0.03  # per-line cost variation, +/- 3%
+
+# Monthly target plan (rules section 10). All values are Proposed planning
+# assumptions fixed before generation; they never use generated sales.
+# (market, year, start monthly revenue USD, plan annual growth, planned gross margin)
+TARGET_PLAN = [
+    ("Thailand", 2024, 65000, 0.04, 0.29),
+    ("Thailand", 2025, 67600, 0.04, 0.29),
+    ("Vietnam", 2024, 40000, 0.18, 0.28),
+    ("Vietnam", 2025, 47200, 0.15, 0.28),
+    ("Indonesia", 2024, 30000, 0.10, 0.27),
+    ("Indonesia", 2025, 33000, 0.10, 0.27),
+]
 
 # Probability that a sales line is a special-discount deal (rules section 6).
 SPECIAL_PROB = {"C11": 0.45, "C18": 0.45, "C02": 0.15, "C09": 0.15, "C16": 0.15}
@@ -195,6 +207,23 @@ def add_prices_and_costs(lines, profiles):
         line["special_pct"] = round(special_pct, 4)
 
 
+def build_monthly_targets():
+    """72 target rows: 3 markets x 24 months, from the plan only.
+
+    revenue_target = start_revenue * (1 + growth) ** ((m - 1) / 12), m = 1..12
+    gross_profit_target = revenue_target * planned_margin
+    Both are rounded to 2 decimals. No random numbers and no sales data are used.
+    """
+    rows = []
+    for market, year, start, growth, margin in TARGET_PLAN:
+        for m in range(1, 13):
+            revenue = start * (1 + growth) ** ((m - 1) / 12)
+            rows.append(
+                (f"{year}-{m:02d}-01", market, round(revenue, 2), round(revenue * margin, 2))
+            )
+    return rows
+
+
 def write_generation_log(lines):
     """Helper file for validation only (kept out of Git by .gitignore)."""
     path = ROOT / "generation_log.csv"
@@ -218,6 +247,7 @@ def main():
     line_counts = build_line_counts()
     lines = build_sales_lines(line_counts, profiles)
     add_prices_and_costs(lines, profiles)
+    targets = build_monthly_targets()
 
     conn.executemany("INSERT INTO products VALUES (?, ?, ?)", PRODUCTS)
     conn.executemany("INSERT INTO customers VALUES (?, ?, ?)", customers)
@@ -232,6 +262,7 @@ def main():
             for r in lines
         ],
     )
+    conn.executemany("INSERT INTO monthly_targets VALUES (?, ?, ?, ?)", targets)
     conn.commit()
     write_generation_log(lines)
 
